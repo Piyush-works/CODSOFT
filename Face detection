@@ -1,0 +1,143 @@
+import os
+import cv2
+import face_recognition
+import numpy as np
+import pickle
+import argparse
+from imutils import paths
+
+def build_encodings(known_dir, encodings_path):
+    print("[INFO] Building face encodings...")
+    imagePaths = list(paths.list_images(known_dir))
+    known_encodings = []
+    known_names = []
+
+    for (i, imagePath) in enumerate(imagePaths):
+        print(f"[INFO] Processing {i+1}/{len(imagePaths)}: {imagePath}")
+        name = os.path.splitext(os.path.basename(imagePath))[0]
+        image = face_recognition.load_image_file(imagePath)
+        boxes = face_recognition.face_locations(image, model='hog')
+        encs = face_recognition.face_encodings(image, boxes)
+        if len(encs) > 0:
+            known_encodings.append(encs[0])
+            known_names.append(name)
+        else:
+            print(f"[WARNING] No face found in {imagePath}")
+
+    data = {'encodings': known_encodings, 'names': known_names}
+    with open(encodings_path, 'wb') as f:
+        pickle.dump(data, f)
+    print(f"[INFO] Saved {len(known_encodings)} encodings to {encodings_path}")
+    return data
+
+
+def load_dnn_model(proto_path, model_path):
+    net = cv2.dnn.readNetFromCaffe(proto_path, model_path)
+    return net
+
+def detect_faces_dnn(net, frame, conf_threshold=0.5):
+    (h, w) = frame.shape[:2]
+    blob = cv2.dnn.blobFromImage(cv2.resize(frame, (300, 300)), 1.0,
+                                 (300, 300), (104.0, 177.0, 123.0))
+    net.setInput(blob)
+    detections = net.forward()
+    rects = []
+    for i in range(0, detections.shape[2]):
+        confidence = detections[0, 0, i, 2]
+        if confidence > conf_threshold:
+            box = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
+            (startX, startY, endX, endY) = box.astype("int")
+            startX = max(0, startX); startY = max(0, startY)
+            endX = min(w-1, endX); endY = min(h-1, endY)
+            rects.append((startY, endX, endY, startX))  # top, right, bottom, left
+    return rects
+
+def detect_faces_haar(cascade, gray):
+    faces = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5,
+                                     minSize=(30, 30), flags=cv2.CASCADE_SCALE_IMAGE)
+    rects = [(y, x+w, y+h, x) for (x, y, w, h) in faces]
+    return rects
+
+def recognize_faces(frame, rects, data):
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    names = []
+    encodings = face_recognition.face_encodings(rgb, rects)
+    for encoding in encodings:
+        matches = face_recognition.compare_faces(data['encodings'], encoding)
+        name = "Unknown"
+        if True in matches:
+            dists = face_recognition.face_distance(data['encodings'], encoding)
+            best = np.argmin(dists)
+            if matches[best]:
+                name = data['names'][best]
+        names.append(name)
+    return names
+
+def draw_results(frame, rects, names):
+    for ((top, right, bottom, left), name) in zip(rects, names):
+        cv2.rectangle(frame, (left, top), (right, bottom), (0, 255, 0), 2)
+        cv2.putText(frame, name, (left, top - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--mode', choices=['webcam', 'image', 'video'], default='webcam')
+    parser.add_argument('--input', help='Path to input image/video (for image/video mode)')
+    parser.add_argument('--detector', choices=['haar', 'dnn'], default='dnn')
+    parser.add_argument('--known-dir', default='known_faces', help='Directory of known faces')
+    parser.add_argument('--encodings', default='encodings.pickle', help='Path to encodings file')
+    parser.add_argument('--prototxt', default='models/deploy.prototxt', help='Path to DNN prototxt')
+    parser.add_argument('--model', default='models/res10_300x300_ssd_iter_140000.caffemodel', help='Path to DNN model')
+    parser.add_argument('--conf', type=float, default=0.5, help='Confidence threshold for DNN')
+    args = parser.parse_args()
+
+if os.path.exists(args.encodings):
+        print(f"[INFO] Loading encodings from {args.encodings}")
+        with open(args.encodings, 'rb') as f:
+            data = pickle.load(f)
+    else:
+        data = build_encodings(args.known_dir, args.encodings)
+
+    dnn_net = None
+    haar_cascade = None
+    if args.detector == 'dnn':
+        dnn_net = load_dnn_model(args.prototxt, args.model)
+    else:
+        haar_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+
+    if args.mode == 'image':
+        image = cv2.imread(args.input)
+        if args.detector == 'dnn':
+            rects = detect_faces_dnn(dnn_net, image, args.conf)
+        else:
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            rects = detect_faces_haar(haar_cascade, gray)
+        names = recognize_faces(image, rects, data)
+        draw_results(image, rects, names)
+        cv2.imshow("Result", image)
+        cv2.waitKey(0)
+        cv2.destroyAllWindows()
+        exit()
+    if args.mode == 'webcam':
+        cap = cv2.VideoCapture(0)
+    else:
+        cap = cv2.VideoCapture(args.input)
+
+    print("[INFO] Press 'q' to quit.")
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        if args.detector == 'dnn':
+            rects = detect_faces_dnn(dnn_net, frame, args.conf)
+        else:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            rects = detect_faces_haar(haar_cascade, gray)
+        names = recognize_faces(frame, rects, data)
+        draw_results(frame, rects, names)
+        cv2.imshow("Face Recognition", frame)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
